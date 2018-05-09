@@ -25,14 +25,15 @@ import urllib.parse
 import urllib.request
 from io import BytesIO, StringIO
 from urllib.request import urlopen
-
+import PyPDF2
 import bs4
 import html2text
 import requests
-from pdfminer.converter import TextConverter
+from pdfminer.converter import TextConverter, PDFPageAggregator, HTMLConverter
 from pdfminer.layout import LAParams
 from pdfminer.pdfinterp import PDFPageInterpreter, PDFResourceManager
 from pdfminer.pdfpage import PDFPage
+
 
 
 class Scraper:
@@ -204,7 +205,7 @@ class Download:
 			return re.sub('/', '-', pattern.group(0))
 
 	def convert_PDF(self, pages=None):
-		# Method for converting PDF Files to TXT files
+		# Method for converting PDF Files to HTM Files, and then to TXT files (Maintains formatting better than direct pdf-text converters)
 		DocName = re.sub('pdf', 'txt', self.get_filename())
 		# if not os.path.isfile(DocName):
 		print('Converting PDF {}'.format(self.get_filename()))
@@ -212,45 +213,50 @@ class Download:
 			pagenums = set()
 		else:
 			pagenums = set(pages)
-		output = StringIO()
+		output = BytesIO()
+		outfp = '' #open(DocName, 'wb')
 		manager = PDFResourceManager()
-		converter = TextConverter(manager, output, laparams=LAParams())
-		interpreter = PDFPageInterpreter(manager, converter)
+		converter = HTMLConverter(manager, output, codec='utf-8', laparams=LAParams(), layoutmode='loose')
 		pdf = urlopen(self.url)
 		data = pdf.read()
+		interpreter = PDFPageInterpreter(manager, converter)
 		fp = BytesIO(data)
 		for page in PDFPage.get_pages(fp, pagenums):
 			interpreter.process_page(page)
 		converter.close()
-		text = output.getvalue()
-		output.close()
-		text_file = open(DocName, 'w', encoding='utf-8')
-		error = 'No Errors Found'
-		try:
-			text_file.write(text)
-		except BaseException:
-			error = Download.recursive_replace(self, text_file.write, text)
-		text_file.close()
-		return print(error)
-
-	# else:
-	# 	return print("{} already exists as txt".format(DocName))
+		fp.close
+		#outfp.close
+		text = output.getvalue().decode('utf-8', errors='ignore')
+		h = html2text.HTML2Text()
+		h.unicode_snob = True
+		h.ignore_images = True
+		h.bypass_tables = False
+		h.ignore_tables = False
+		h.ignore_emphasis = True
+		h.body_width = 0
+		h.ignore_links = True
+		htm2text = h.handle(text)
+		new_text = re.sub(r'\n\s*\n', '\n\n', htm2text)
+		fp = open(DocName, 'w', encoding='utf-8')
+		fp.write(new_text)
+		fp.close
 
 	def convert_HTM(self):
 		print("Downloading and Converting HTM Download: {}".format(self.get_filename()))
 		DocName = re.sub('htm', 'txt', self.get_filename())
-		response = requests.get(self.url).text
+		response = requests.get(self.url)
 		h = html2text.HTML2Text()
 		h.unicode_snob = True
 		h.ignore_images = True
-		h.bypass_tables = True
-		text = h.handle(response)
-		text = re.sub(r'(?<=Secretary\n).*', '', text, flags=re.DOTALL)
-		text = re.sub(r'(\n\))|(\n:)', '', text, flags=re.DOTALL)
-		text = re.sub(r'.*(?=UNITED STATES OF AMERICA|United States of America)', '\n', text,
-					  flags=re.DOTALL | re.MULTILINE)
+		h.bypass_tables = False
+		h.ignore_tables = True
+		h.ignore_emphasis = True
+		h.body_width = 0
+		h.ignore_links = True
+		text = h.handle(response.text)
+		new_text = re.sub(r'\n\s*\n', '\n\n', text)
 		fp = open(DocName, 'w', encoding='utf-8')
-		fp.write(text)
+		fp.write(new_text)
 		fp.close
 		return
 
@@ -260,15 +266,15 @@ class Download:
 		print("Downloading and Converting TXT Download: {}".format(DocName))
 		response = urlopen(self.url)
 		data = response.read()
-		body = data.decode('utf-8', errors='ignore')
-		fp = open(DocName, 'w', encoding='utf-8')
-		error = 'No Errors Found'
+		text = data.decode('utf-8', errors='ignore')
+		#error = 'No Errors Found'
+		fp = open(DocName, 'w', encoding='utf-8', newline='\n')
 		try:
-			fp.write(body)
+			fp.write(text)
 		except BaseException:
-			error = Download.recursive_replace(self, fp.write, body)
+			error = Download.recursive_replace(self, fp.write, text)
 		fp.close()
-		return print(error)
+		# return print(error)
 
 	def create_dir(self):
 		# Method for creating sub-directory to save downloaded files
@@ -290,7 +296,7 @@ class Download:
 		new_file.close()
 		fp.close()
 		os.chdir('..')
-		return "Copied Download to Text Directory"
+		return "Copied Download to: {}".format(dir)
 
 
 class Order:
@@ -299,7 +305,7 @@ class Order:
 
 	def __init__(self, order):
 		self.order = order
-		self.text = open(order, 'r', encoding='utf-8').read()
+		self.text = re.sub(r'\n\s*\n', '\n\n', open(order, 'r', encoding='utf-8').read())
 		self.filing_date = {}
 		self.defendants = {}
 		self.file_no = {}
@@ -312,165 +318,216 @@ class Order:
 
 	def get_caption(self, text, part):
 		if part == 'left':
-			caption_pattern = re.compile(r'^.*?\s(?=(\)|:)\s)', flags=re.MULTILINE)
+			caption_pattern = re.compile(r'^ {3,}\w* .+? {1,}(?::|\))', flags=re.MULTILINE)
 		elif part == 'right':
-			caption_pattern = re.compile(r'(?<=\s(\)|:)\s)\w*.*', flags=re.MULTILINE)
-		matches = re.finditer(caption_pattern, text)
+			caption_pattern = re.compile(r' (?::|\)) {1,}[A-ZA-Z]{2,}.+'
+										 , flags=re.MULTILINE)
+		matches = re.findall(caption_pattern, text)
+		caption = ''
 		if matches:
-			caption = ''
 			for match in matches:
-				caption += '\n' + match.group(0)
-			return caption
+				caption += '\n' + match
 		else:
-			return print("Could not locate caption")
+			caption = False
+		return caption
 
 	def filter_proceeding(self):
-		# Filter Proceedings based on Caption Contents
-		soup = bs4.BeautifulSoup(self.text, 'html5lib')
-		caption_pattern = re.compile(r'(.*?Order|Order).*?(Instituting|of).*?(Proceedings|Proceeding|suspension).+?',
-									 flags=re.IGNORECASE | re.DOTALL)
-		caption_tags = soup.find('td', text=caption_pattern)
+		# Filter Proceedings based on Caption Heading(PROCEEDING|PROCEEDINGS|PROCEEDDINGS|SUSPENSION).+?
+		caption_pattern = re.compile(r'''## FIRST MATCH
+										((^\|.{0,25})|(\|.{0,5}))((?!Ordered)Order|(?!ORDERED)ORDER).+?((?!Ordered)|(?!ORDERED).+?)
+										## FIRST MATCH ENDS WITH
+										((---\|---)| # ends with ---|---
+										(?!I\.\w+,)I\..{0,5}\n| #ends with I. but not when I. is an initial
+										I\n\n| # ends with normal I
+										\|.{0,3}[^\n]:.{0,25}\n{2,}| # ends with | : \n
+										[^\.].\n{2,}\w{4,}(?:.+?\.)?)#|#Does not end with a period, has two newlines, followed by a sentence. 
+										## SECOND MATCH
+										#((-\n.{0,5}\#.{0,3})((?!Ordered)Order|(?!ORDERED)ORDER).+?((?!Ordered)|(?!ORDERED).+?) #- \n # Order....
+										## SECOND MATCH ENDS WITH
+										#(((?!I\.\w+,)I\..{0,5}\n)| #I. but not when it is an initial
+										#(I\n\n)| # I
+										#((?![^\.]\n{2}.+?\w+)[^\.]\n{2})| # does not end with a period; has two new lines, but not if it is followed by a sentence 
+										#(?=[A-Z][a-z].+?\.\n)))| # The beginning of a sentence
+										## THIRD MATCH
+										#(-.{0,5}\n{1,3}((?!Ordered)Order|(?!ORDERED)ORDER).+?((?!Ordered)|(?!ORDERED)).+?\n\n)|
+										## FOURTH MATCH
+										#((\d+) +?\n{1,}((?!Ordered)Order|(?!ORDERED)ORDER).+?((?!Ordered)|(?!ORDERED)).+?[^\.]\n{2,})|
+										### FIFTH MATCH
+										#(^\n((?!Ordered)Order|(?!ORDERED)ORDER).+?((?!Ordered)|(?!ORDERED)).+?([^\.]\n{2,}I\..{0,5}(?=[A-Z][a-z])))|
+										## SIXTH MATCH
+										#(^((?!Ordered)Order|(?!ORDERED)ORDER).+?((?!Ordered)|(?!ORDERED)).+?[^\.]\n{2,}I\.)
+										''', flags = re.DOTALL|re.X|re.MULTILINE)
+
+		filter_pattern = re.compile(r'''
+										(Order.+?Instituting.+?Administrative.+?Proceedings)|
+										(Order.+?Instituting.+?Public.+?Administrative.+?Proceedings)|
+										(Order.+?Instituting.+?Administrative.+?and.+?Cease.+?and.+?Desist.+?Proceedings)|
+										(Order.+?Instituting.+?Public.+?Administrative.+?and.+?Cease.+?and.+?Desist.+?Proceedings)|
+										(Order.+?Instituting.+?Cease.+?and.+?Desist.+?Proceedings)|
+										(Order.+?of.+?Forthwith.+?Suspension)|
+										(Order.+?of.+?Suspension)
+										''', flags=re.DOTALL|re.X|re.MULTILINE|re.IGNORECASE)
 		title = ''
-		if caption_tags:
-			caption = caption_tags.get_text(strip=True)
-			caption = caption.strip()
-			caption = caption.replace('\n', ' ').replace('*', '').replace(':', '').replace('-', ' ').replace('<', '')
-			title += caption
-		if title == '':
-			all_tags = soup.find('table')
-			if all_tags:
-				pattern = re.compile(r"order", flags=re.IGNORECASE)
-				final_caption = ' '
-				if re.findall(pattern, all_tags.get_text()):
-					pattern = re.compile(
-						r'(.*)?(Order|Instituting|Public|Administrative|Cease|Decist|Proceeding|Proceedings|Pursuant'
-						r'|Securities|Act|Making|Sanctions|Suspension|Forthwith|Findings|Imposing).*',
-						flags=re.IGNORECASE)
-					caption = all_tags.get_text()
-					if re.finditer(pattern, caption):
-						for match in re.finditer(pattern, caption):
-							text = re.sub('\*(\)|:)', '', match.group(0))
-							text = re.sub('\*', '', text)
-							text = re.sub('\n', ' ', text)
-							final_caption += text
-						title += final_caption
-				else:
-					text = self.text
-					pattern = re.compile(r'(order instituting.*?|order of.*?)\n\n', flags=re.DOTALL | re.IGNORECASE)
-					match = re.search(pattern, text)
-					if match:
-						type = re.sub('\n', '', match.group(0))
-						if type.endswith('-'):
-							caption = self.get_caption(text, 'right')
-							caption = re.sub('\n', ' ', caption)
-							caption = re.sub('-', ' ', caption)
-							title += caption
-						else:
-							title += type
-			if title == '':
-				text = self.text
-				pattern = re.compile(r'(order instituting.*?|order of.*?)\n\n', flags=re.DOTALL | re.IGNORECASE)
-				match = re.search(pattern, text)
-
-				if match:
-					match = match.group(0)
-					type = re.sub('\n', '-', match)
-					if type.endswith('-'):
-						caption = self.get_caption(text, 'right')
-						if caption:
-							caption = re.sub('\n', ' ', caption)
-							caption = re.sub('-', ' ', caption)
-							title += caption
-						else:
-							type = re.sub('--', '', type)
-							title += type
-		self.proceeding_header = title
-		one = re.compile(
-			r"Order(.+?|\s+)?Instituting(.+?|\s+)?Administrative(.+?|\s+)?and(.+?|\s+)?Cease(.+?|\s+)?and("
-			r".+?|\s+)?Desist("
-			r".+?|\s+)?(Proceedings|Proceeding).*",
-			flags=re.IGNORECASE | re.DOTALL)
-		two = re.compile(
-			r"Order(.+?|\s+)?Instituting(.+?|\s+)?Public(.+?|\s+)?Administrative(.+?|\s+)?and(.+?|\s+)?Cease("
-			r".+?|\s+)?and("
-			r".+?|\s+)?Desist(.+?|\s+)?(Proceedings|Proceeding).+?",
-			flags=re.IGNORECASE | re.DOTALL)
-		three = re.compile(
-			r"Order(.+?|\s+)?Instituting(.+?|\s+)?Cease(.+?|\s+)?and(.+?|\s+)?Desist(.+?|\s+)?("
-			r"Proceedings|Proceeding).+?",
-			flags=re.IGNORECASE | re.DOTALL)
-		four = re.compile(
-			r"Order(.+?|\s+)?Instituting(.+?|\s+)?Administrative(.+?|\s+)?(Proceedings|Proceeding).+?",
-			flags=re.IGNORECASE | re.DOTALL)
-		five = re.compile(
-			r"Order(.+?|\s+)?Instituting(.+?|\s+)?Public(.+?|\s+)?Administrative(.+?|\s+)?(Proceedings|Proceeding).+?",
-			flags=re.IGNORECASE | re.DOTALL)
-		six = re.compile(r"Order(.+?|\s+)?of(.+?|\s+)?Forthwith(.+?|\s+)?Suspension.+?",
-						 flags=re.IGNORECASE | re.DOTALL)
-		seven = re.compile(r"Order(.+?|\s+)?of(.+?|\s+)?Suspension.+?", flags=re.IGNORECASE | re.DOTALL)
-		if re.search(one, title):
-			Download.copy_file(self.order, '.\\relevant_orders')
-		elif re.search(two, title):
-			Download.copy_file(self.order, '.\\relevant_orders')
-		elif re.search(three, title):
-			Download.copy_file(self.order, '.\\relevant_orders')
-		elif re.search(four, title):
-			Download.copy_file(self.order, '.\\relevant_orders')
-		elif re.search(five, title):
-			Download.copy_file(self.order, '.\\relevant_orders')
-		elif re.search(six, title):
-			Download.copy_file(self.order, '.\\relevant_orders')
-		elif re.search(seven, title):
-			Download.copy_file(self.order, '.\\relevant_orders')
+		matches = re.search(caption_pattern, self.text)
+		caption_match = self.get_caption(self.text, 'right')
+		if (matches and not caption_match):
+			print(matches.group(0))
+			title = matches.group(0)
+			clean = re.sub(r' {1,}: {1,}', '', title)
+			clean = re.sub(r' {1,}\) {1,}', '', clean)
+			clean = re.sub(r'\|', '', clean)
+			clean = re.sub(r'-{1,}', ' ', clean)
+			clean = re.sub(r'\n{1,}', ' ', clean)
+			clean = re.sub(r' {1,}', r' ', clean)
+			clean = re.sub(r'_{1,}', r' ', clean)
+			# print(clean)
+			self.matches.append(self.order)
+		elif (caption_match and not matches):
+			title = caption_match
+			clean = re.sub(r' {1,}: {1,}', '', title)
+			clean = re.sub(r' {1,}\) {1,}', '', clean)
+			clean = re.sub(r'\|', '', clean)
+			clean = re.sub(r'-{1,}', ' ', clean)
+			clean = re.sub(r'\n{1,}', ' ', clean)
+			clean = re.sub(r' {1,}', r' ', clean)
+			clean = re.sub(r'_{1,}', r' ', clean)
+			# print(clean)
+			self.matches.append(self.order)
+		elif (caption_match and matches):
+			print("BOTH MATCHED")
+			#print(matches.group(0))
+			title_one = re.sub(r'\n', ' ', matches.group(0))
+			clean_one = re.sub(r' {1,}: {1,}', '', title_one)
+			clean_one = re.sub(r' {1,}\) {1,}', '', clean_one)
+			clean_one = re.sub(r'\|', '', clean_one)
+			clean_one = re.sub(r'-{1,}', ' ', clean_one)
+			clean_one = re.sub(r'\n{1,}', ' ', clean_one)
+			clean_one = re.sub(r' {1,}', r' ', clean_one)
+			clean_one = re.sub(r'_{1,}', r' ', clean_one)
+			title_two = re.sub(r'\n', ' ', caption_match)
+			clean_two = re.sub(r' {1,}: {1,}', '', title_two)
+			clean_two= re.sub(r' {1,}\) {1,}', '', clean_two)
+			clean_two= re.sub(r'\|', '', clean_two)
+			clean_two= re.sub(r'-{1,}', ' ', clean_two)
+			clean_two= re.sub(r'\n{1,}', ' ', clean_two)
+			clean_two= re.sub(r' {1,}', r' ', clean_two)
+			clean_two= re.sub(r'_{1,}', r' ', clean_two)
+			self.matches.append(self.order)
+			# print(clean_one)
+			print('---------second match------------')
+			# print(clean_two)
 		else:
-			Order.no_matches.append(self.order)
+			self.no_matches.append(self.order)
 
-	### TO DO: Handle Corner Cases where caption is not formatted in html.
+		#
+
+		# # Go through files with preserved formatting
+		# if self.get_caption(self.text, 'right'):
+		#
+		# 	caption_header = self.get_caption(self.text,'right')
+		# 	header_text = re.sub(r'\n', r'\s', caption_header)
+		# 	if '\|' in header_text:
+		# 		title='NO TITLE FOUND'
+		# 	else:
+		# 		title += header_text
+		# 	print('CAPTION FUNCTION GOT THIS')
+		# 	print(title)
+		# # If we still dont have a title, it means the file did not have preserved formatting, and we need another way to sift through the caption
+		# if title == '':
+		# 	if match:
+		# 		header_text =match.group(0).replace('\n', '\s')
+		# 		header_pattern =  re.search(r'ORDER.*?\|', header_text, flags=re.DOTALL)
+		# 		if header_pattern:
+		# 			title += header_pattern.group(0)
+		# 		else:
+		# 			header_pattern = re.search(r'ORDER.*', header_text, flags=re.DOTALL)
+		# 			if header_pattern:
+		# 				title += header_pattern.group(0)
+		# 				# print(title)
+		# 			else:
+		# 				title = 'NO TITLE FOUND'
+		# 	print("\nOTHER FUNCTIONS GOT THIS")
+		# 	print(title)
+		# filter = re.compile(r'''
+		# 									(ORDER.+INSTITUTING.+(PROCEEDING|PROCEEDDINGS|PROCEEDINGS))|
+		# 									(ORDER.+INSTITUTING.+PUBLIC.+ADMINISTRATIVE.+PROCEEDINGS)|
+		# 									(ORDER.+INSTITUTING.+ADMINISTRATIVE.+AND.+CEASE.+AND.+DESIST.+PROCEEDINGS)|
+		# 									(ORDER.+INSTITUTING.+PUBLIC.+ADMINISTRATIVE.+AND.+CEASE.+AND.+DESIST
+		# 									.+PROCEEDINGS)|
+		# 									(ORDER.+INSTITUTING.+CEASE.+AND.+DESIST.+PROCEEDINGS)|
+		# 									(ORDER.+OF.+FORTHWITH.+SUSPENSION)|
+		# 									(ORDER.+OF.+SUSPENSION)''', flags=re.X | re.DOTALL)
+		# filter_match = re.search(filter, title)
+		# if filter_match:
+		# 	# Order.matches.append(self.order)
+		# 	Download.copy_file(self.order, 'Relevant Order')
+		# else:
+		# 	pass
+
+	# Order.no_matches.append(self.order)
+		# else:
+		# 	if self.get_caption(self.text, "right"):
+		# 		# print("CAPTION")
+		# 		# Order.matches.append(self.order)
+		# 		# print(self.get_caption(self.text, 'right'))
+		#
+
 
 	def get_names(self):
 		# Return names of defendants from SEC Filing Caption
-		soup = bs4.BeautifulSoup(self.text, 'html5lib')
-		pattern = re.compile(r'(matter|respondent|respondents).+?(respondent|respondents)?',
-							 flags=re.IGNORECASE | re.DOTALL)
-		caption_tag = soup.find('td', text=pattern)
-		defendants = ''
-		if caption_tag:
-			caption = caption_tag.get_text(strip=True)
-			new_pattern = re.compile(r'(^.+In.*?of)|(^In.*?of)|(Respondents|Respondent).+',
-									 flags=re.IGNORECASE | re.DOTALL)
-			caption = re.sub(new_pattern, '', caption).replace(r'Respondent', '').replace('Respondant', '').replace(
-				'Respondents', '')
-			name = caption.replace('*', '').replace('>', '').replace(':', '').replace('\xa0', '').replace('\n',
-																										  ' ').strip()
-			no_spaces = re.compile(r"\s+(?=\s[A-Z|a-z])")
-			name = re.sub(no_spaces, '', name)
-			defendants += name
-		elif caption_tag is None:
-			caption = self.get_caption(self.text, 'left')
-			clean_pattern = re.compile(r"(In the Matter of|Respondent|Respondents|Respondant|Respondants)\.?",
-									   flags=re.IGNORECASE)
-			name = re.sub(clean_pattern, '', caption)
-			name = re.sub('\n', ' ', name)
-			no_spaces = re.compile(r"\s+(?=\s[A-Z|a-z])")
-			name = re.sub(no_spaces, '', name)
-			defendants += name
-		if defendants == '':
-			text = self.text
-			pattern = re.compile(r'^The.+?(announced|deems).*?\n{2,}', flags=re.DOTALL | re.MULTILINE)
-			para_1 = re.search(pattern, text)
-			if para_1:
-				para = re.sub('\n', ' ', para_1.group(0))
-				names_line = re.search(r'(?<=against).*?("\)\.|\))', para, flags=re.MULTILINE | re.DOTALL)
-				if names_line:
-					clean_pattern = re.compile(r'(pursuant.+|respondent|\("?.+?"\))', flags=re.IGNORECASE)
-					names = re.sub(clean_pattern, '', names_line.group(0))
-					defendants += names.strip('"').strip('.').strip()
-		if defendants == '':
-			print("Could not identify defendants in ", self.order)
-			Order.no_matches.append(self.order)
-			Download.copy_file(self.order, "NO NAME MATCH")
+		caption_pattern = re.compile(r'''
+									((?<=\|).*?matter.*?(respondent|respondents|respondant|respondants|\|))|
+									(In the Matter of.*?(Respondent\.|Respondents\.|Respondants\.|Respondant\.))
+									(In the Matter of.*?)(Respondent\.|Respondents\.|Respondants\.|Respondant\.).*?(I\.\n|\*I\.)''',
+									 flags = re.DOTALL|re.MULTILINE|re.IGNORECASE|re.X)
+		name = ''
+		match = re.search(caption_pattern, self.text)
+		if match:
+			print(match.group(0))
 		else:
-			self.defendants.setdefault("Defendants", defendants)
+			Order.no_matches.append(self.order)
+		# soup = bs4.BeautifulSoup(self.text, 'html5lib')
+		# pattern = re.compile(r'(matter|respondent|respondents).+?(respondent|respondents)?',
+		# 					 flags=re.IGNORECASE | re.DOTALL)
+		# caption_tag = soup.find('td', text=pattern)
+		# defendants = ''
+		# if caption_tag:
+		# 	caption = caption_tag.get_text(strip=True)
+		# 	new_pattern = re.compile(r'(^.+In.*?of)|(^In.*?of)|(Respondents|Respondent).+',
+		# 							 flags=re.IGNORECASE | re.DOTALL)
+		# 	caption = re.sub(new_pattern, '', caption).replace(r'Respondent', '').replace('Respondant', '').replace(
+		# 		'Respondents', '')
+		# 	name = caption.replace('*', '').replace('>', '').replace(':', '').replace('\xa0', '').replace('\n',
+		# 																								  ' ').strip()
+		# 	no_spaces = re.compile(r"\s+(?=\s[A-Z|a-z])")
+		# 	name = re.sub(no_spaces, '', name)
+		# 	defendants += name
+		# elif caption_tag is None:
+		# 	caption = self.get_caption(self.text, 'left')
+		# 	clean_pattern = re.compile(r"(In the Matter of|Respondent|Respondents|Respondant|Respondants)\.?",
+		# 							   flags=re.IGNORECASE)
+		# 	name = re.sub(clean_pattern, '', caption)
+		# 	name = re.sub('\n', ' ', name)
+		# 	no_spaces = re.compile(r"\s+(?=\s[A-Z|a-z])")
+		# 	name = re.sub(no_spaces, '', name)
+		# 	defendants += name
+		# if defendants == '':
+		# 	text = self.text
+		# 	pattern = re.compile(r'^The.+?(announced|deems).*?\n{2,}', flags=re.DOTALL | re.MULTILINE)
+		# 	para_1 = re.search(pattern, text)
+		# 	if para_1:
+		# 		para = re.sub('\n', ' ', para_1.group(0))
+		# 		names_line = re.search(r'(?<=against).*?("\)\.|\))', para, flags=re.MULTILINE | re.DOTALL)
+		# 		if names_line:
+		# 			clean_pattern = re.compile(r'(pursuant.+|respondent|\("?.+?"\))', flags=re.IGNORECASE)
+		# 			names = re.sub(clean_pattern, '', names_line.group(0))
+		# 			defendants += names.strip('"').strip('.').strip()
+		# if defendants == '':
+		# 	print("Could not identify defendants in ", self.order)
+		# 	Order.no_matches.append(self.order)
+		# 	Download.copy_file(self.order, "NO NAME MATCH")
+		# else:
+		# 	self.defendants.setdefault("Defendants", defendants)
 
 	def get_filing_date(self):
 		# Returns filing date from SEC Administrative Proceeding
@@ -573,20 +630,21 @@ class Order:
 					text = self.text
 					pattern = re.compile(r'(order instituting.*?|order of.*?)\n\n', flags=re.DOTALL | re.IGNORECASE)
 					match = re.search(pattern, text)
-					type = re.sub('\n', '', match.group(0))
-					if type.endswith('-'):
-						caption = self.get_caption(text, 'right')
-						caption = re.sub('\n', ' ', caption)
-						caption = re.sub('-', ' ', caption)
-						title += caption
-					else:
-						title += type
-			if title == '':
-				text = self.text
-				pattern = re.compile(r'(order instituting.*?|order of.*?)\n\n', flags=re.DOTALL | re.IGNORECASE)
-				match = re.search(pattern, text)
+					if match:
+						type = re.sub('\n', '', match.group(0))
+						if type.endswith('-'):
+							caption = self.get_caption(text, 'right')
+							caption = re.sub('\n', ' ', caption)
+							caption = re.sub('-', ' ', caption)
+							title += caption
+						else:
+							title += type
+		if title == '':
+			text = self.text
+			pattern = re.compile(r'(order instituting.*?|order of.*?)\n\n', flags=re.DOTALL | re.IGNORECASE)
+			match = re.search(pattern, text)
+			if match:
 				match = match.group(0)
-
 				type = re.sub('\n', '-', match)
 				if type.endswith('-'):
 					caption = self.get_caption(text, 'right')
@@ -603,17 +661,21 @@ class Order:
 			Download.copy_file(self.order, '.\\No Type')
 			print("Could not identify proceeding type.\nProceeding moved to folder 'No Type' folder.")
 			Order.no_matches.append(self.order)
-		# Is the action contested
-		if re.search(r"Notice(.+|\s+)of(.+|\s+)Hearing", title, flags=re.IGNORECASE):
-			self.filing_status.setdefault("Filing Status", "Contested")
-			if re.search("(Offer|Offers)(.+|\s+)of(.+|\s+)Settlement", self.text):
-				self.settlement.setdefault("Settlement Offered", "Yes")
-			else:
-				self.settlement.setdefault("Settlement Offered", "No")
+
+		# If you find the title
 
 		else:
-			self.filing_status.setdefault("Filing Status", "Settled")
-			self.settlement.setdefault("Settlement Offered", "Not Applicable. Proceeding Uncontested")
+			# Check if the action contested
+			if re.search(r"Notice(.+|\s+)of(.+|\s+)Hearing", title, flags=re.IGNORECASE):
+				self.filing_status.setdefault("Filing Status", "Contested")
+				# Check if a settlement was offered
+				if re.search("(Offer|Offers)(.+|\s+)of(.+|\s+)Settlement", self.text):
+					self.settlement.setdefault("Settlement Offered", "Yes")
+				else:
+					self.settlement.setdefault("Settlement Offered", "No")
+			else:
+				self.filing_status.setdefault("Filing Status", "Settled")
+				self.settlement.setdefault("Settlement Offered", "Not Applicable. Uncontested Proceeding")
 		# Was there an admission?
 		if re.search(r"without(.+|\s+)admitting(.+|\s+)or(.+|\s+)denying", self.text, flags=re.IGNORECASE):
 			self.admission.setdefault("Admission", 'No')
@@ -672,6 +734,9 @@ class Order:
 
 
 if __name__ == '__main__':
+	# os.chdir('pdf test')
+	# link = 'https://www.sec.gov/litigation/admin/2018/34-83191.pdf'#'https://www.sec.gov/litigation/admin/3436561.txt'
+	# Download(link).convert_PDF()
 	years = Scraper('https://www.sec.gov/litigation/admin.shtml', links=True, special=True, extension='shtml',
 					keywords=['litigation', 'admin'], condition='and').links
 	proceedings = []
@@ -701,7 +766,7 @@ if __name__ == '__main__':
 				continue
 			Download(proceeding).convert_TXT()
 		elif proceeding.endswith('pdf'):
-			os.chdir(pdf_dir)
+			os.chdir(htm_dir)
 			# print(os.getcwd())
 			# print(document)
 			if os.path.isfile(document):
